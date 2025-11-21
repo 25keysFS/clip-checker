@@ -27,13 +27,6 @@ html, body { background:#222; font-family: Arial; color:white; margin:0; padding
 .row { margin-bottom:6px; }
 .label { color:#00bfff; }
 .value { color:white; }
-.details-toggle {
-  cursor:pointer;
-  margin-top:10px;
-  color:#00bfff;
-  font-size:18px;
-}
-.hidden { display:none; }
 </style>
 </head>
 <body>
@@ -96,16 +89,14 @@ async function analyzeFile(file){
         if(!moov) return;
         for(let i=moov.start;i<moov.end;i++){
           if(readString(i,4)==="stsd"){
-            // search for known codec signatures
-            let region = new Uint8Array(buf.slice(i, i+300));
+            let region = new Uint8Array(buf.slice(i, i+400));
             let text = Array.from(region).map(c=>String.fromCharCode(c)).join("");
             let candidates=["avc1","hvc1","av01","vp09"];
             for(let c of candidates){
               let idx=text.indexOf(c);
               if(idx!==-1){ codec=c; }
             }
-            // try extracting width/height by scanning for valid pairs
-            for(let k=i;k<i+300;k++){
+            for(let k=i;k<i+400;k++){
               try{
                 let w=v.getUint16(k);
                 let h=v.getUint16(k+2);
@@ -119,54 +110,53 @@ async function analyzeFile(file){
       }
       searchStsd();
 
-      // Accurate duration detection (mdhd > mvhd fallback)
-let duration = null;
-let timescale = null;
-let tracks = 0;
+      // duration + timescale from mdhd > mvhd fallback
+      let duration=null, timescale=null, tracks=0;
+      if(moov){
+        for(let i=moov.start;i<moov.end;i++){
+          if(readString(i,4)==="trak") tracks++;
 
-if (moov) {
-  for (let i = moov.start; i < moov.end; i++) {
+          if(readString(i,4)==="mdhd"){
+            let version=v.getUint8(i+8);
+            if(version===0){
+              timescale=v.getUint32(i+20);
+              duration=v.getUint32(i+24);
+            } else {
+              timescale=v.getUint32(i+28);
+              duration=v.getUint32(i+36+4);
+            }
+          }
 
-    // Count tracks
-    if (readString(i, 4) === "trak") tracks++;
-
-    // mdhd — BEST source of clip duration
-    if (readString(i, 4) === "mdhd") {
-      let version = v.getUint8(i + 8);
-
-      if (version === 0) {
-        // version 0 (32-bit duration)
-        timescale = v.getUint32(i + 20);
-        duration  = v.getUint32(i + 24);
-      } else if (version === 1) {
-        // version 1 (64-bit duration, take lower 32 bits)
-        timescale = v.getUint32(i + 28);
-        duration  = v.getUint32(i + 36 + 4);
+          if(readString(i,4)==="mvhd" && duration===null){
+            timescale=v.getUint32(i+20);
+            duration=v.getUint32(i+24);
+          }
+        }
       }
-    }
 
-    // mvhd fallback — only used if mdhd wasn't found
-    if (readString(i, 4) === "mvhd" && duration === null) {
-      timescale = v.getUint32(i + 20);
-      duration  = v.getUint32(i + 24);
-    }
-  }
-}
-// Recorder inference
+      let seconds=(duration&&timescale)? duration/timescale : 0;
+
+      // Bitrate estimation
+      let bitrate = (file.size * 8) / (seconds || 1);
+
+      // Fake detection heuristics
+      let suspicious = [];
+      if(bitrate < 500000) suspicious.push("Very low bitrate — possible re-encode");
+      if(width % 2 !== 0 || height % 2 !== 0) suspicious.push("Non-even resolution — unusual for ShadowPlay");
+
+      // Recorder detection
       let recorder="Unknown Recorder";
-
       if(codec==="avc1" || codec==="hvc1"){
         if(brands.includes("mp41")||brands.includes("mp42")||brands.includes("isom")){
           recorder="NVIDIA ShadowPlay";
         }
       }
-
       if(height===1088) recorder="Windows Game Bar";
       if(brands.join(",").toLowerCase().includes("med")) recorder="Medal.tv";
       if(codec==="av01") recorder="OBS (AV1)";
       if(brands.includes("qt  ")) recorder="OBS (QuickTime)";
 
-      // GPU vendor
+      // GPU Vendor
       let gpu="Unknown";
       if(recorder==="NVIDIA ShadowPlay") gpu="NVIDIA";
       if(recorder==="OBS (AV1)") gpu="Likely NVIDIA/AMD";
@@ -187,7 +177,9 @@ if (moov) {
           "Resolution": (width&&height) ? width+" x "+height : "Unknown",
           "Tracks":tracks,
           "File Size":fmtBytes(file.size),
-          "Duration": (duration&&timescale)? fmtTime(duration/timescale) : "Unknown"
+          "Duration": fmtTime(seconds),
+          "Bitrate": (bitrate/1000000).toFixed(2)+" Mbps",
+          "Suspicious Flags": suspicious.length? suspicious.join("; ") : "None detected"
         }
       });
 
@@ -211,14 +203,8 @@ document.getElementById("dropzone").addEventListener("drop",async e=>{
   verdictBox.textContent=result.verdict;
   container.appendChild(verdictBox);
 
-  let toggle=document.createElement("div");
-  toggle.className="details-toggle";
-  toggle.textContent="Show / Hide Forensic Details";
-  toggle.onclick=()=>card.classList.toggle("hidden");
-  container.appendChild(toggle);
-
   let card=document.createElement("div");
-  card.className="card hidden";
+  card.className="card";
 
   let title=document.createElement("div");
   title.className="card-title";
