@@ -4,14 +4,35 @@
 <meta charset="UTF-8">
 <title>Clip Checker</title>
 <style>
-body { font-family: Arial; background:#111; color:white; padding:20px; }
-.banner { text-align:center; padding:15px; font-size:28px; border-bottom:2px solid #00bfff; margin-bottom:20px; }
+body { font-family: Arial, background:#111; color:white; margin:0; padding:20px; }
+.banner { text-align:center; padding:20px; font-size:32px; border-bottom:2px solid #00bfff; margin-bottom:25px; }
 #dropzone {
-  border:2px dashed #00bfff; padding:40px; text-align:center;
-  border-radius:10px; background:#222; margin-bottom:20px; font-size:18px;
+  border:2px dashed #00bfff; padding:50px; text-align:center;
+  border-radius:10px; background:#222; margin-bottom:20px; font-size:20px;
 }
-#result { background:#222; padding:20px; border-radius:10px; white-space:pre-wrap; }
-.details { margin-top:10px; cursor:pointer; color:#00bfff; }
+#result { margin-top:20px; }
+.card {
+  border:1px solid #00bfff;
+  padding:15px;
+  margin-top:10px;
+  border-radius:8px;
+  background:#1a1a1a;
+}
+.card-title {
+  font-size:20px;
+  font-weight:bold;
+  margin-bottom:10px;
+  color:#00bfff;
+}
+.row { margin-bottom:6px; }
+.label { color:#00bfff; }
+.value { color:white; }
+.details-toggle {
+  cursor:pointer;
+  margin-top:10px;
+  color:#00bfff;
+  font-size:18px;
+}
 .hidden { display:none; }
 </style>
 </head>
@@ -23,120 +44,163 @@ body { font-family: Arial; background:#111; color:white; padding:20px; }
 <div id="result"></div>
 
 <script>
-function readString(view, offset, length){
-  let s=""; for(let i=0;i<length;i++) s+=String.fromCharCode(view.getUint8(offset+i));
-  return s;
+function fmtBytes(bytes){
+  const sizes=["Bytes","KB","MB","GB"];
+  let i=Math.floor(Math.log(bytes)/Math.log(1024));
+  return (bytes/Math.pow(1024,i)).toFixed(2)+" "+sizes[i];
 }
-function u32(v,o){return v.getUint32(o);}
-function u16(v,o){return v.getUint16(o);}
-
-function parseBoxes(buf){
-  let v=new DataView(buf), boxes=[],pos=0;
-  while(pos+8<=buf.byteLength){
-    let size=u32(v,pos),type=readString(v,pos+4,4);
-    if(size<8) break;
-    boxes.push({type,start:pos,end:pos+size});
-    pos+=size;
-  }
-  return boxes;
+function fmtTime(sec){
+  if(!sec) return "Unknown";
+  let m=Math.floor(sec/60), s=Math.floor(sec%60);
+  return m+"m "+s+"s";
 }
 
-function extractBasic(buf){
-  let v=new DataView(buf);
-  let boxes=parseBoxes(buf);
-  let ftyp=boxes.find(b=>b.type==="ftyp");
-  let moov=boxes.find(b=>b.type==="moov");
+async function analyzeFile(file){
+  return new Promise((resolve)=>{
+    let reader=new FileReader();
+    reader.onload=function(){
+      let buf=reader.result;
+      let v=new DataView(buf);
 
-  let brands=[],codec=null,width=null,height=null,tracks=0;
-  let duration=null,timescale=null,filesize=buf.byteLength;
-
-  if(ftyp){
-    let major=readString(v,ftyp.start+8,4); brands.push(major);
-    for(let i=ftyp.start+16;i<ftyp.end;i+=4){
-      if(i+4<=ftyp.end) brands.push(readString(v,i,4));
-    }
-  }
-
-  if(moov){
-    for(let i=moov.start+8;i<moov.end;){
-      let size=u32(v,i),type=readString(v,i+4,4);
-      if(type==="trak") tracks++;
-      if(type==="mvhd"){
-        timescale=u32(v,i+20);
-        duration=u32(v,i+24);
+      // Parse Boxes
+      function readString(off,len){
+        let s=""; for(let i=0;i<len;i++) s+=String.fromCharCode(v.getUint8(off+i));
+        return s;
       }
-      if(type==="trak"){
-        for(let j=i+8;j<i+size;){
-          let s2=u32(v,j),t2=readString(v,j+4,4);
-          if(t2==="mdia"){
-            for(let k=j+8;k<j+s2;){
-              let s3=u32(v,k),t3=readString(v,k+4,4);
-              if(t3==="minf"){
-                for(let m=k+8;m<k+s3;){
-                  let s4=u32(v,m),t4=readString(v,m+4,4);
-                  if(t4==="stbl"){
-                    for(let n=m+8;n<m+s4;){
-                      let s5=u32(v,n),t5=readString(v,n+4,4);
-                      if(t5==="stsd"){
-                        codec=readString(v,n+16,4);
-                        width=u16(v,n+40); height=u16(v,n+42);
-                      }
-                      n+=s5||8;
-                    }
-                  }
-                  m+=s4||8;
-                }
-              }
-              k+=s3||8;
-            }
-          }
-          j+=s2||8;
+      let pos=0, boxes=[];
+      while(pos+8<=buf.byteLength){
+        let size=v.getUint32(pos), type=readString(pos+4,4);
+        if(size<8) break;
+        boxes.push({type,start:pos,end:pos+size});
+        pos+=size;
+      }
+
+      let ftyp=boxes.find(b=>b.type==="ftyp");
+      let moov=boxes.find(b=>b.type==="moov");
+
+      // Extract brands
+      let brands=[];
+      if(ftyp){
+        brands.push(readString(ftyp.start+8,4));
+        for(let i=ftyp.start+16;i<ftyp.end;i+=4){
+          brands.push(readString(i,4));
         }
       }
-      i+=size||8;
-    }
-  }
 
-  let fps=null;
-  if(timescale && duration) fps = (duration/timescale)?null:null; // placeholder
+      // Extract codec, dimensions, tracks, duration
+      let codec=null, width=null, height=null, tracks=0, duration=null, timescale=null;
+      if(moov){
+        for(let i=moov.start+8;i<moov.end;){
+          let size=v.getUint32(i), type=readString(i+4,4);
 
-  return {brands,codec,width,height,tracks,duration,timescale,filesize};
-}
+          if(type==="trak") tracks++;
+          if(type==="mvhd"){
+            timescale=v.getUint32(i+20);
+            duration=v.getUint32(i+24);
+          }
+          if(type==="trak"){
+            for(let j=i+8;j<i+size;){
+              let s2=v.getUint32(j), t2=readString(j+4,4);
+              if(t2==="mdia"){
+                for(let k=j+8;k<j+s2;){
+                  let s3=v.getUint32(k), t3=readString(k+4,4);
+                  if(t3==="minf"){
+                    for(let m=k+8;m<k+s3;){
+                      let s4=v.getUint32(m), t4=readString(m+4,4);
+                      if(t4==="stbl"){
+                        for(let n=m+8;n<m+s4;){
+                          let s5=v.getUint32(n), t5=readString(n+4,4);
+                          if(t5==="stsd"){
+                            codec=readString(n+16,4);
+                            width=v.getUint16(n+40);
+                            height=v.getUint16(n+42);
+                          }
+                          n+=s5||8;
+                        }
+                      }
+                      m+=s4||8;
+                    }
+                  }
+                  k+=s3||8;
+                }
+              }
+              j+=s2||8;
+            }
+          }
 
-function classify(info){
-  let {brands,codec,width,height,tracks}=info;
-  let brandOK = brands.some(b=>["isom","iso2","mp41","mp42"].includes(b));
-  let codecOK = (codec==="avc1"||codec==="hvc1");
-  let heightOK = (height!==1088);
+          i+=size||8;
+        }
+      }
 
-  let valid = brandOK && codecOK && heightOK;
-  let summary = valid? "✅ VALID: Likely NVIDIA Recording" : "❌ INVALID: Not NVIDIA";
-  return summary;
+      // Classification
+      let brandOK = brands.some(b=>["isom","iso2","mp41","mp42"].includes(b));
+      let codecOK = (codec==="avc1" || codec==="hvc1");
+      let heightOK = (height !== 1088);
+
+      let valid = brandOK && codecOK && heightOK;
+      let verdict = valid ? "VALID: Likely NVIDIA Recording" : "INVALID: Not NVIDIA";
+
+      // Forensic data
+      let forensic = {
+        "File Name": file.name,
+        "Brands": brands.join(", "),
+        "Codec": codec,
+        "Resolution": width+" x "+height,
+        "Tracks": tracks,
+        "File Size": fmtBytes(file.size),
+        "Duration": duration && timescale ? fmtTime(duration/timescale) : "Unknown"
+      };
+
+      resolve({verdict, forensic});
+    };
+    reader.readAsArrayBuffer(file);
+  });
 }
 
 document.getElementById("dropzone").addEventListener("dragover",e=>e.preventDefault());
-document.getElementById("dropzone").addEventListener("drop",e=>{
+document.getElementById("dropzone").addEventListener("drop",async e=>{
   e.preventDefault();
   let file=e.dataTransfer.files[0];
-  let r=new FileReader();
-  r.onload=function(){
-    let buf=r.result;
-    let info=extractBasic(buf);
-    let summary=classify(info);
+  let result=await analyzeFile(file);
 
-    let details="";
-    details+="Brands: "+info.brands.join(", ")+"\n";
-    details+="Codec: "+info.codec+"\n";
-    details+="Resolution: "+info.width+"x"+info.height+"\n";
-    details+="Tracks: "+info.tracks+"\n";
-    details+="File size: "+info.filesize+" bytes\n";
+  let container=document.getElementById("result");
+  container.innerHTML="";
 
-    document.getElementById("result").innerHTML=
-      summary+
-      "<div class='details' onclick='document.getElementById("fx").classList.toggle("hidden")'>Show/Hide Forensic Details</div>"+
-      "<div id='fx' class='hidden'>"+details+"</div>";
-  };
-  r.readAsArrayBuffer(file);
+  let main=document.createElement("div");
+  main.style.fontSize="22px";
+  main.style.marginBottom="10px";
+  main.textContent=result.verdict;
+  container.appendChild(main);
+
+  let toggle=document.createElement("div");
+  toggle.className="details-toggle";
+  toggle.textContent="Show / Hide Forensic Details";
+  toggle.onclick=()=>card.classList.toggle("hidden");
+  container.appendChild(toggle);
+
+  let card=document.createElement("div");
+  card.className="card hidden";
+
+  let title=document.createElement("div");
+  title.className="card-title";
+  title.textContent="Forensic Details";
+  card.appendChild(title);
+
+  for(let key in result.forensic){
+    let row=document.createElement("div");
+    row.className="row";
+    let label=document.createElement("span");
+    label.className="label";
+    label.textContent=key+": ";
+    let value=document.createElement("span");
+    value.className="value";
+    value.textContent=result.forensic[key];
+    row.appendChild(label);
+    row.appendChild(value);
+    card.appendChild(row);
+  }
+
+  container.appendChild(card);
 });
 </script>
 
