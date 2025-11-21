@@ -4,11 +4,11 @@
 <meta charset="UTF-8">
 <title>Clip Checker</title>
 <style>
-body { font-family: Arial, background:#111; color:white; margin:0; padding:20px; }
+html, body { background:#222; font-family: Arial; color:white; margin:0; padding:20px; }
 .banner { text-align:center; padding:20px; font-size:32px; border-bottom:2px solid #00bfff; margin-bottom:25px; }
 #dropzone {
   border:2px dashed #00bfff; padding:50px; text-align:center;
-  border-radius:10px; background:#222; margin-bottom:20px; font-size:20px;
+  border-radius:10px; background:#333; margin-bottom:20px; font-size:20px;
 }
 #result { margin-top:20px; }
 .card {
@@ -16,7 +16,7 @@ body { font-family: Arial, background:#111; color:white; margin:0; padding:20px;
   padding:15px;
   margin-top:10px;
   border-radius:8px;
-  background:#1a1a1a;
+  background:#2a2a2a;
 }
 .card-title {
   font-size:20px;
@@ -44,8 +44,9 @@ body { font-family: Arial, background:#111; color:white; margin:0; padding:20px;
 <div id="result"></div>
 
 <script>
+// Utility
 function fmtBytes(bytes){
-  const sizes=["Bytes","KB","MB","GB"];
+  const sizes=["B","KB","MB","GB"];
   let i=Math.floor(Math.log(bytes)/Math.log(1024));
   return (bytes/Math.pow(1024,i)).toFixed(2)+" "+sizes[i];
 }
@@ -55,6 +56,7 @@ function fmtTime(sec){
   return m+"m "+s+"s";
 }
 
+// Parse MP4
 async function analyzeFile(file){
   return new Promise((resolve)=>{
     let reader=new FileReader();
@@ -62,11 +64,12 @@ async function analyzeFile(file){
       let buf=reader.result;
       let v=new DataView(buf);
 
-      // Parse Boxes
       function readString(off,len){
         let s=""; for(let i=0;i<len;i++) s+=String.fromCharCode(v.getUint8(off+i));
         return s;
       }
+
+      // parse boxes
       let pos=0, boxes=[];
       while(pos+8<=buf.byteLength){
         let size=v.getUint32(pos), type=readString(pos+4,4);
@@ -78,7 +81,7 @@ async function analyzeFile(file){
       let ftyp=boxes.find(b=>b.type==="ftyp");
       let moov=boxes.find(b=>b.type==="moov");
 
-      // Extract brands
+      // brands
       let brands=[];
       if(ftyp){
         brands.push(readString(ftyp.start+8,4));
@@ -87,90 +90,105 @@ async function analyzeFile(file){
         }
       }
 
-      // Extract codec, dimensions, tracks, duration
-      let codec=null, width=null, height=null, tracks=0, duration=null, timescale=null;
-      if(moov){
-        for(let i=moov.start+8;i<moov.end;){
-          let size=v.getUint32(i), type=readString(i+4,4);
+      // find stsd and smart-detect codec + resolution
+      let codec="Unknown", width=null, height=null;
+      function searchStsd(){
+        if(!moov) return;
+        for(let i=moov.start;i<moov.end;i++){
+          if(readString(i,4)==="stsd"){
+            // search for known codec signatures
+            let region = new Uint8Array(buf.slice(i, i+300));
+            let text = Array.from(region).map(c=>String.fromCharCode(c)).join("");
+            let candidates=["avc1","hvc1","av01","vp09"];
+            for(let c of candidates){
+              let idx=text.indexOf(c);
+              if(idx!==-1){ codec=c; }
+            }
+            // try extracting width/height by scanning for valid pairs
+            for(let k=i;k<i+300;k++){
+              try{
+                let w=v.getUint16(k);
+                let h=v.getUint16(k+2);
+                if(w>100 && h>100 && w<10000 && h<10000){
+                  width=w; height=h; return;
+                }
+              }catch{}
+            }
+          }
+        }
+      }
+      searchStsd();
 
-          if(type==="trak") tracks++;
-          if(type==="mvhd"){
+      // duration
+      let duration=null, timescale=null, tracks=0;
+      if(moov){
+        for(let i=moov.start;i<moov.end;i++){
+          if(readString(i,4)==="mvhd"){
             timescale=v.getUint32(i+20);
             duration=v.getUint32(i+24);
           }
-          if(type==="trak"){
-            for(let j=i+8;j<i+size;){
-              let s2=v.getUint32(j), t2=readString(j+4,4);
-              if(t2==="mdia"){
-                for(let k=j+8;k<j+s2;){
-                  let s3=v.getUint32(k), t3=readString(k+4,4);
-                  if(t3==="minf"){
-                    for(let m=k+8;m<k+s3;){
-                      let s4=v.getUint32(m), t4=readString(m+4,4);
-                      if(t4==="stbl"){
-                        for(let n=m+8;n<m+s4;){
-                          let s5=v.getUint32(n), t5=readString(n+4,4);
-                          if(t5==="stsd"){
-                            codec=readString(n+16,4);
-                            width=v.getUint16(n+40);
-                            height=v.getUint16(n+42);
-                          }
-                          n+=s5||8;
-                        }
-                      }
-                      m+=s4||8;
-                    }
-                  }
-                  k+=s3||8;
-                }
-              }
-              j+=s2||8;
-            }
-          }
-
-          i+=size||8;
+          if(readString(i,4)==="trak") tracks++;
         }
       }
 
-      // Classification
-      let brandOK = brands.some(b=>["isom","iso2","mp41","mp42"].includes(b));
-      let codecOK = (codec==="avc1" || codec==="hvc1");
-      let heightOK = (height !== 1088);
+      // Recorder inference
+      let recorder="Unknown Recorder";
 
-      let valid = brandOK && codecOK && heightOK;
-      let verdict = valid ? "VALID: Likely NVIDIA Recording" : "INVALID: Not NVIDIA";
+      if(codec==="avc1" || codec==="hvc1"){
+        if(brands.includes("mp41")||brands.includes("mp42")||brands.includes("isom")){
+          recorder="NVIDIA ShadowPlay";
+        }
+      }
 
-      // Forensic data
-      let forensic = {
-        "File Name": file.name,
-        "Brands": brands.join(", "),
-        "Codec": codec,
-        "Resolution": width+" x "+height,
-        "Tracks": tracks,
-        "File Size": fmtBytes(file.size),
-        "Duration": duration && timescale ? fmtTime(duration/timescale) : "Unknown"
-      };
+      if(height===1088) recorder="Windows Game Bar";
+      if(brands.join(",").toLowerCase().includes("med")) recorder="Medal.tv";
+      if(codec==="av01") recorder="OBS (AV1)";
+      if(brands.includes("qt  ")) recorder="OBS (QuickTime)";
 
-      resolve({verdict, forensic});
+      // GPU vendor
+      let gpu="Unknown";
+      if(recorder==="NVIDIA ShadowPlay") gpu="NVIDIA";
+      if(recorder==="OBS (AV1)") gpu="Likely NVIDIA/AMD";
+      if(recorder==="Windows Game Bar") gpu="Microsoft (WDDM)";
+
+      // Verdict
+      let verdict = recorder==="NVIDIA ShadowPlay" ? 
+        "VALID — NVIDIA Recording" : "INVALID — Non-NVIDIA";
+
+      resolve({
+        verdict,
+        forensic:{
+          "File Name":file.name,
+          "Recorder":recorder,
+          "GPU Vendor":gpu,
+          "Brands":brands.join(", "),
+          "Codec":codec,
+          "Resolution": (width&&height) ? width+" x "+height : "Unknown",
+          "Tracks":tracks,
+          "File Size":fmtBytes(file.size),
+          "Duration": (duration&&timescale)? fmtTime(duration/timescale) : "Unknown"
+        }
+      });
+
     };
     reader.readAsArrayBuffer(file);
   });
 }
 
+// UI
 document.getElementById("dropzone").addEventListener("dragover",e=>e.preventDefault());
 document.getElementById("dropzone").addEventListener("drop",async e=>{
   e.preventDefault();
   let file=e.dataTransfer.files[0];
   let result=await analyzeFile(file);
-
   let container=document.getElementById("result");
   container.innerHTML="";
 
-  let main=document.createElement("div");
-  main.style.fontSize="22px";
-  main.style.marginBottom="10px";
-  main.textContent=result.verdict;
-  container.appendChild(main);
+  let verdictBox=document.createElement("div");
+  verdictBox.style.fontSize="24px";
+  verdictBox.style.marginBottom="15px";
+  verdictBox.textContent=result.verdict;
+  container.appendChild(verdictBox);
 
   let toggle=document.createElement("div");
   toggle.className="details-toggle";
