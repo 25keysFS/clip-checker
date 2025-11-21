@@ -1,1 +1,424 @@
-<!-- final file placeholder -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Clip Checker</title>
+<style>
+html, body {
+  background:#222;
+  font-family: Arial, sans-serif;
+  color:#fff;
+  margin:0;
+  padding:20px;
+}
+.banner {
+  text-align:center;
+  padding:20px;
+  font-size:32px;
+  border-bottom:2px solid #00bfff;
+  margin-bottom:25px;
+}
+#dropzone {
+  border:2px dashed #00bfff;
+  padding:50px;
+  text-align:center;
+  border-radius:10px;
+  background:#333;
+  margin-bottom:20px;
+  font-size:20px;
+}
+#result {
+  margin-top:20px;
+}
+.card {
+  border:1px solid #00bfff;
+  padding:15px;
+  margin-top:10px;
+  border-radius:8px;
+  background:#2a2a2a;
+}
+.card-title {
+  font-size:20px;
+  font-weight:bold;
+  margin-bottom:10px;
+  color:#00bfff;
+}
+.row {
+  margin-bottom:6px;
+}
+.label {
+  color:#00bfff;
+}
+.value {
+  color:#fff;
+}
+.verdict {
+  font-size:24px;
+  margin-bottom:10px;
+}
+
+/* Risk meter (narrow, centered, solid bar) */
+.risk-container {
+  margin:10px auto 20px auto;
+  max-width:300px;
+  text-align:center;
+}
+.risk-label {
+  margin-bottom:4px;
+}
+.risk-bar-outer {
+  width:100%;
+  height:14px;
+  border-radius:7px;
+  background:#555;
+  overflow:hidden;
+}
+.risk-bar-inner {
+  height:100%;
+  width:0%;
+  border-radius:7px;
+}
+</style>
+</head>
+<body>
+
+<div class="banner">🎥 Clip Checker</div>
+
+<div id="dropzone">Drop MP4 file here</div>
+<div id="result"></div>
+
+<script>
+// Utility helpers
+function fmtBytes(bytes){
+  if (!bytes && bytes !== 0) return "Unknown";
+  const sizes=["B","KB","MB","GB"];
+  let i=Math.floor(Math.log(bytes)/Math.log(1024));
+  i=Math.max(0,Math.min(i,sizes.length-1));
+  return (bytes/Math.pow(1024,i)).toFixed(2)+" "+sizes[i];
+}
+function fmtTime(sec){
+  if(!sec || !isFinite(sec) || sec<=0) return "Unknown";
+  let m=Math.floor(sec/60), s=Math.floor(sec%60);
+  return m+"m "+s+"s";
+}
+
+// Main analysis
+async function analyzeFile(file){
+  return new Promise((resolve)=>{
+    const reader = new FileReader();
+    reader.onload = function(){
+      const buf = reader.result;
+      const v = new DataView(buf);
+
+      function readString(off,len){
+        let s=""; 
+        for(let i=0;i<len;i++){
+          s+=String.fromCharCode(v.getUint8(off+i));
+        }
+        return s;
+      }
+
+      // ---- Parse top-level boxes ----
+      let pos = 0;
+      let boxes = [];
+      while(pos+8 <= buf.byteLength){
+        let size = v.getUint32(pos);
+        let type = readString(pos+4,4);
+        if(size < 8) break;
+        boxes.push({type, start:pos, end:pos+size});
+        pos += size;
+      }
+
+      let ftyp = boxes.find(b=>b.type==="ftyp");
+      let moov = boxes.find(b=>b.type==="moov");
+
+      // ---- Brands from ftyp ----
+      let brands = [];
+      if(ftyp){
+        brands.push(readString(ftyp.start+8,4));
+        for(let i=ftyp.start+16;i<ftyp.end;i+=4){
+          if(i+4<=ftyp.end){
+            brands.push(readString(i,4));
+          }
+        }
+      }
+
+      // ---- Smart codec + resolution detection from stsd ----
+      let codec = "Unknown";
+      let width = null;
+      let height = null;
+
+      function scanStsd(){
+        if(!moov) return;
+        for(let i=moov.start;i<moov.end-4;i++){
+          if(readString(i,4)==="stsd"){
+            // Read a small region around stsd
+            let regionEnd = Math.min(buf.byteLength, i+600);
+            let region = new Uint8Array(buf.slice(i, regionEnd));
+            let text = Array.from(region).map(c=>String.fromCharCode(c)).join("");
+
+            const candidates=["avc1","hvc1","av01","vp09"];
+            for(let c of candidates){
+              if(text.indexOf(c)!==-1){
+                codec = c;
+                break;
+              }
+            }
+
+            // scan for plausible width/height pairs
+            for(let k=i;k<regionEnd-4;k++){
+              try{
+                let w = v.getUint16(k);
+                let h = v.getUint16(k+2);
+                if(w>100 && h>100 && w<10000 && h<10000){
+                  width = w;
+                  height = h;
+                  return;
+                }
+              }catch(e){}
+            }
+          }
+        }
+      }
+      scanStsd();
+
+      // ---- Duration and tracks: mdhd > mvhd fallback ----
+      let tracks = 0;
+      let bestSeconds = 0;
+
+      if(moov){
+        for(let i=moov.start;i<moov.end-4;i++){
+          let type = readString(i,4);
+
+          // count tracks
+          if(type === "trak") tracks++;
+
+          // mdhd boxes (can appear multiple times, audio + video)
+          if(type === "mdhd"){
+            let version = v.getUint8(i+8);
+            let timescale, duration;
+            if(version === 0){
+              timescale = v.getUint32(i+20);
+              duration  = v.getUint32(i+24);
+            }else{
+              timescale = v.getUint32(i+28);
+              duration  = v.getUint32(i+36+4);
+            }
+            if(timescale && duration){
+              let sec = duration / timescale;
+              if(sec > bestSeconds) bestSeconds = sec;
+            }
+          }
+
+          // mvhd fallback (only if nothing from mdhd)
+          if(type === "mvhd" && bestSeconds === 0){
+            let timescale = v.getUint32(i+20);
+            let duration  = v.getUint32(i+24);
+            if(timescale && duration){
+              bestSeconds = duration / timescale;
+            }
+          }
+        }
+      }
+
+      const durationSec = bestSeconds || 0;
+
+      // ---- Bitrate estimation ----
+      const bitrateBitsPerSecond = durationSec ? (file.size * 8) / durationSec : 0;
+      const bitrateMbps = bitrateBitsPerSecond ? (bitrateBitsPerSecond / 1000000) : 0;
+      // ---- Recorder detection heuristics ----
+      let brandsLower = brands.join(",").toLowerCase();
+      let recorder = "Unknown Recorder";
+
+      const isH264orHEVC = (codec==="avc1" || codec==="hvc1");
+      const hasShadowPlayBrand = brands.some(b=>["mp41","mp42","isom","iso2"].includes(b));
+      const hasMedal = brandsLower.includes("med");
+      const hasQt = brands.includes("qt  ");
+      const isAv1 = (codec==="av01");
+
+      if(isH264orHEVC && hasShadowPlayBrand && height !== 1088 && width && width>=800){
+        recorder = "NVIDIA ShadowPlay";
+      }
+      if(height === 1088){
+        recorder = "Windows Game Bar";
+      }
+      if(hasMedal){
+        recorder = "Medal.tv";
+      }
+      if(isAv1){
+        recorder = "OBS (AV1)";
+      }
+      if(hasQt && recorder==="Unknown Recorder"){
+        recorder = "OBS (QuickTime)";
+      }
+
+      // ---- GPU Vendor inference ----
+      let gpuVendor = "Unknown";
+      if(recorder === "NVIDIA ShadowPlay") gpuVendor = "NVIDIA";
+      if(recorder === "OBS (AV1)") gpuVendor = "Likely NVIDIA/AMD";
+      if(recorder === "Windows Game Bar") gpuVendor = "Microsoft (WDDM)";
+
+      // ---- Suspicious / anti-fake heuristics & risk score ----
+      let suspiciousFlags = [];
+      let risk = 0;
+
+      // Base: non-NVIDIA recording
+      if(recorder !== "NVIDIA ShadowPlay"){
+        risk += 40;
+        suspiciousFlags.push("Recorder is not NVIDIA ShadowPlay");
+      }
+
+      // Low bitrate (likely re-encode / compression)
+      if(bitrateMbps && bitrateMbps < 1.0){
+        risk += 30;
+        suspiciousFlags.push("Very low bitrate — possible re-encode or edited upload");
+      }
+
+      // Odd resolution (non-even or very small)
+      if(width && height){
+        if(width % 2 !== 0 || height % 2 !== 0){
+          risk += 15;
+          suspiciousFlags.push("Resolution has odd dimensions — unusual for direct ShadowPlay");
+        }
+        if(width < 800 || height < 600){
+          risk += 10;
+          suspiciousFlags.push("Very small resolution for PC gameplay");
+        }
+      }
+
+      // Brand / codec mismatch
+      if(codec==="avc1" && brandsLower.includes("dash")){
+        risk += 15;
+        suspiciousFlags.push("DASH-style brand with AVC1 — possible web-stream rip");
+      }
+
+      // Duration sanity (if completely missing)
+      if(!durationSec || durationSec <= 0.5){
+        risk += 10;
+        suspiciousFlags.push("Duration missing or extremely short");
+      }
+
+      // Clamp risk 0–100
+      if(risk < 0) risk = 0;
+      if(risk > 100) risk = 100;
+
+      // Risk label + color
+      let riskLabel = "Safe";
+      let riskColor = "#00c853"; // green
+      if(risk > 20 && risk <= 50){
+        riskLabel = "Suspicious";
+        riskColor = "#ffb300"; // yellow
+      } else if(risk > 50){
+        riskLabel = "Likely Fake / Edited";
+        riskColor = "#d50000"; // red
+      }
+
+      // Verdict
+      let verdict = recorder==="NVIDIA ShadowPlay"
+        ? "VALID — NVIDIA Recording"
+        : "INVALID — Non-NVIDIA or Unknown Recorder";
+
+      // ---- Build result object ----
+      resolve({
+        verdict,
+        risk,
+        riskLabel,
+        riskColor,
+        forensic: {
+          "File Name": file.name,
+          "Recorder": recorder,
+          "GPU Vendor": gpuVendor,
+          "Brands": brands.join(", "),
+          "Codec": codec,
+          "Resolution": (width && height) ? (width+" x "+height) : "Unknown",
+          "Tracks": tracks,
+          "File Size": fmtBytes(file.size),
+          "Duration": fmtTime(durationSec),
+          "Bitrate": bitrateMbps ? bitrateMbps.toFixed(2)+" Mbps" : "Unknown",
+          "Suspicious Flags": suspiciousFlags.length ? suspiciousFlags.join("; ") : "None detected"
+        }
+      });
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// ---- UI wiring ----
+const dropzone = document.getElementById("dropzone");
+const resultDiv = document.getElementById("result");
+
+dropzone.addEventListener("dragover", e=>{
+  e.preventDefault();
+});
+
+dropzone.addEventListener("drop", async e=>{
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if(!file){
+    return;
+  }
+
+  const analysis = await analyzeFile(file);
+
+  // Clear previous
+  resultDiv.innerHTML = "";
+
+  // Verdict
+  const verdictEl = document.createElement("div");
+  verdictEl.className = "verdict";
+  verdictEl.textContent = analysis.verdict;
+  resultDiv.appendChild(verdictEl);
+
+  // Risk meter (narrow, centered)
+  const riskContainer = document.createElement("div");
+  riskContainer.className = "risk-container";
+
+  const riskLabelEl = document.createElement("div");
+  riskLabelEl.className = "risk-label";
+  riskLabelEl.textContent = "Risk Score: " + analysis.risk + "% (" + analysis.riskLabel + ")";
+  riskContainer.appendChild(riskLabelEl);
+
+  const barOuter = document.createElement("div");
+  barOuter.className = "risk-bar-outer";
+
+  const barInner = document.createElement("div");
+  barInner.className = "risk-bar-inner";
+  barInner.style.width = analysis.risk + "%";
+  barInner.style.background = analysis.riskColor;
+
+  barOuter.appendChild(barInner);
+  riskContainer.appendChild(barOuter);
+  resultDiv.appendChild(riskContainer);
+
+  // Forensic card (auto-expanded)
+  const card = document.createElement("div");
+  card.className = "card";
+
+  const title = document.createElement("div");
+  title.className = "card-title";
+  title.textContent = "Forensic Details";
+  card.appendChild(title);
+
+  for(const key in analysis.forensic){
+    const row = document.createElement("div");
+    row.className = "row";
+
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = key + ": ";
+
+    const value = document.createElement("span");
+    value.className = "value";
+    value.textContent = analysis.forensic[key];
+
+    row.appendChild(label);
+    row.appendChild(value);
+    card.appendChild(row);
+  }
+
+  resultDiv.appendChild(card);
+});
+</script>
+
+</body>
+</html>
