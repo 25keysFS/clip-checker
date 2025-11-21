@@ -119,19 +119,40 @@ async function analyzeFile(file){
       }
       searchStsd();
 
-      // duration
-      let duration=null, timescale=null, tracks=0;
-      if(moov){
-        for(let i=moov.start;i<moov.end;i++){
-          if(readString(i,4)==="mvhd"){
-            timescale=v.getUint32(i+20);
-            duration=v.getUint32(i+24);
-          }
-          if(readString(i,4)==="trak") tracks++;
-        }
-      }
+      // Accurate duration detection (mdhd > mvhd fallback)
+let duration = null;
+let timescale = null;
+let tracks = 0;
 
-      // Recorder inference
+if (moov) {
+  for (let i = moov.start; i < moov.end; i++) {
+
+    // Count tracks
+    if (readString(i, 4) === "trak") tracks++;
+
+    // mdhd — BEST source of clip duration
+    if (readString(i, 4) === "mdhd") {
+      let version = v.getUint8(i + 8);
+
+      if (version === 0) {
+        // version 0 (32-bit duration)
+        timescale = v.getUint32(i + 20);
+        duration  = v.getUint32(i + 24);
+      } else if (version === 1) {
+        // version 1 (64-bit duration, take lower 32 bits)
+        timescale = v.getUint32(i + 28);
+        duration  = v.getUint32(i + 36 + 4);
+      }
+    }
+
+    // mvhd fallback — only used if mdhd wasn't found
+    if (readString(i, 4) === "mvhd" && duration === null) {
+      timescale = v.getUint32(i + 20);
+      duration  = v.getUint32(i + 24);
+    }
+  }
+}
+// Recorder inference
       let recorder="Unknown Recorder";
 
       if(codec==="avc1" || codec==="hvc1"){
