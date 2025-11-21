@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>NVIDIA Clip Checker</title>
+<style>
+body { font-family: Arial; background:#111; color:white; padding:20px; }
+#dropzone {
+  border:2px dashed #00bfff; padding:40px; text-align:center; margin-top:20px;
+  border-radius:10px; background:#222;
+}
+#result { margin-top:20px; padding:20px; background:#333; border-radius:10px; white-space:pre-wrap; }
+.pass { color:#00ff99; }
+.fail { color:#ff6666; }
+</style>
+</head>
+<body>
+
+<h1>NVIDIA Clip Checker (Option B)</h1>
+<p>Drag & drop an MP4 file below.</p>
+
+<div id="dropzone">Drop MP4 file here</div>
+<div id="result"></div>
+
+<script>
+function readUint32(view, offset){ return view.getUint32(offset); }
+function readString(view, offset, length){
+  let s=""; for(let i=0;i<length;i++) s+=String.fromCharCode(view.getUint8(offset+i));
+  return s;
+}
+
+function parseBoxes(buffer){
+  let view = new DataView(buffer);
+  let pos = 0;
+  let boxes = [];
+  while(pos + 8 <= buffer.byteLength){
+    let size = readUint32(view, pos);
+    let type = readString(view, pos+4, 4);
+    if(size < 8) break;
+    boxes.push({type:type, start:pos, end:pos+size});
+    pos += size;
+  }
+  return boxes;
+}
+
+function analyzeMP4(buffer){
+  let view = new DataView(buffer);
+  let boxes = parseBoxes(buffer);
+  let result = { brands:[], codec:null, tracks:0, width:null, height:null, issues:[] };
+
+  let ftyp = boxes.find(b=>b.type==="ftyp");
+  if(ftyp){
+    let major = readString(view, ftyp.start+8, 4);
+    result.brands.push("major:"+major);
+    for(let i=ftyp.start+16;i<ftyp.end;i+=4){
+      if(i+4 <= ftyp.end) result.brands.push("brand:"+readString(view,i,4));
+    }
+  }
+
+  let moov = boxes.find(b=>b.type==="moov");
+  if(!moov){ result.issues.push("No moov box."); return result; }
+
+  for(let i=moov.start+8;i<moov.end;){
+    let size = readUint32(view,i);
+    let type = readString(view,i+4,4);
+    if(type==="trak") result.tracks++;
+    i += size || 8;
+  }
+
+  for(let i=moov.start+8;i<moov.end;){
+    let size = readUint32(view,i);
+    let type = readString(view,i+4,4);
+    if(type==="trak"){
+      for(let j=i+8;j<i+size;){
+        let s2 = readUint32(view,j);
+        let t2 = readString(view,j+4,4);
+        if(t2==="mdia"){
+          for(let k=j+8;k<j+s2;){
+            let s3 = readUint32(view,k);
+            let t3 = readString(view,k+4,4);
+            if(t3==="minf"){
+              for(let m=k+8;m<k+s3;){
+                let s4 = readUint32(view,m);
+                let t4 = readString(view,m+4,4);
+                if(t4==="stbl"){
+                  for(let n=m+8;n<m+s4;){
+                    let s5 = readUint32(view,n);
+                    let t5 = readString(view,n+4,4);
+                    if(t5==="stsd"){
+                      let entryType = readString(view,n+16,4);
+                      result.codec = entryType;
+                      result.width = view.getUint16(n+16+24);
+                      result.height = view.getUint16(n+16+26);
+                    }
+                    n += s5 || 8;
+                  }
+                }
+                m += s4 || 8;
+              }
+            }
+            k += s3 || 8;
+          }
+        }
+        j += s2 || 8;
+      }
+    }
+    i += size || 8;
+  }
+  return result;
+}
+
+function classify(r){
+  let out = "";
+  if(r.tracks !== 1){
+    out += "❌ Not NVIDIA: NVIDIA uses 1 video track (2 total streams: video+audio).\n";
+  }
+  if(r.codec && !(r.codec==="avc1" || r.codec==="hvc1")){
+    out += "❌ Not NVIDIA: Unexpected codec "+r.codec+"\n";
+  }
+  if(r.height===1088){
+    out += "❌ Not NVIDIA: Height padded to 1088 (Game Bar/Medal signature).\n";
+  }
+  let brandStr = r.brands.join(", ");
+  if(!brandStr.includes("isom") && !brandStr.includes("mp41") && !brandStr.includes("mp42")){
+    out += "❌ Container brands inconsistent with NVIDIA.\n";
+  }
+  if(out==="") out = "✅ Valid NVIDIA (basic verification).";
+  return out;
+}
+
+document.getElementById("dropzone").addEventListener("dragover",e=>{e.preventDefault();});
+document.getElementById("dropzone").addEventListener("drop",e=>{
+  e.preventDefault();
+  let file = e.dataTransfer.files[0];
+  let reader = new FileReader();
+  reader.onload = function(){
+    let buffer = reader.result;
+    let res = analyzeMP4(buffer);
+    let report = "Brands: "+res.brands.join(", ")+"\n"+
+                 "Codec: "+res.codec+"\n"+
+                 "Tracks: "+res.tracks+"\n"+
+                 "Width/Height: "+res.width+"x"+res.height+"\n"+
+                 "\nAnalysis:\n"+classify(res)+"\n";
+    document.getElementById("result").textContent = report;
+  };
+  reader.readAsArrayBuffer(file);
+});
+</script>
+
+</body>
+</html>
