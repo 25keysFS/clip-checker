@@ -2,146 +2,155 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>NVIDIA Clip Checker</title>
+<title>Clip Checker</title>
 <style>
 body { font-family: Arial; background:#111; color:white; padding:20px; }
-#dropzone {
-  border:2px dashed #00bfff; padding:40px; text-align:center; margin-top:20px;
-  border-radius:10px; background:#222;
+h1 { text-align:center; font-size:32px; margin-bottom:10px; }
+.banner {
+  text-align:center; padding:15px; font-size:26px;
+  border-bottom:2px solid #00bfff; margin-bottom:20px;
 }
-#result { margin-top:20px; padding:20px; background:#333; border-radius:10px; white-space:pre-wrap; }
-.pass { color:#00ff99; }
-.fail { color:#ff6666; }
+#dropzone {
+  border:2px dashed #00bfff; padding:40px; text-align:center;
+  border-radius:10px; background:#222; margin-bottom:20px;
+}
+#result { background:#222; padding:20px; border-radius:10px; white-space:pre-wrap; }
+.details { margin-top:10px; cursor:pointer; color:#00bfff; }
+.hidden { display:none; }
 </style>
 </head>
 <body>
 
-<h1>NVIDIA Clip Checker</h1>
-<p>Drag & drop an MP4 file below.</p>
+<div class="banner">🎥 Clip Checker</div>
 
 <div id="dropzone">Drop MP4 file here</div>
 <div id="result"></div>
 
 <script>
-function readUint32(view, offset){ return view.getUint32(offset); }
+// Utility functions
 function readString(view, offset, length){
   let s=""; for(let i=0;i<length;i++) s+=String.fromCharCode(view.getUint8(offset+i));
   return s;
 }
 
-function parseBoxes(buffer){
-  let view = new DataView(buffer);
-  let pos = 0;
-  let boxes = [];
-  while(pos + 8 <= buffer.byteLength){
-    let size = readUint32(view, pos);
-    let type = readString(view, pos+4, 4);
-    if(size < 8) break;
-    boxes.push({type:type, start:pos, end:pos+size});
-    pos += size;
+async function analyze(buffer){
+  const view = new DataView(buffer);
+
+  // Basic parsing for MP4 boxes
+  function getBoxes(){
+    let boxes=[], pos=0;
+    while(pos+8 <= buffer.byteLength){
+      let size=view.getUint32(pos), type=readString(view,pos+4,4);
+      if(size<8) break;
+      boxes.push({type, start:pos, end:pos+size});
+      pos+=size;
+    }
+    return boxes;
   }
-  return boxes;
-}
 
-function analyzeMP4(buffer){
-  let view = new DataView(buffer);
-  let boxes = parseBoxes(buffer);
-  let result = { brands:[], codec:null, tracks:0, width:null, height:null, issues:[] };
+  let boxes=getBoxes();
+  let ftyp=boxes.find(b=>b.type==="ftyp");
+  let moov=boxes.find(b=>b.type==="moov");
 
-  let ftyp = boxes.find(b=>b.type==="ftyp");
+  // Extract brands
+  let brands=[];
   if(ftyp){
-    let major = readString(view, ftyp.start+8, 4);
-    result.brands.push("major:"+major);
+    let major=readString(view, ftyp.start+8, 4);
+    brands.push(major);
     for(let i=ftyp.start+16;i<ftyp.end;i+=4){
-      if(i+4 <= ftyp.end) result.brands.push("brand:"+readString(view,i,4));
+      if(i+4<=ftyp.end) brands.push(readString(view,i,4));
     }
   }
 
-  let moov = boxes.find(b=>b.type==="moov");
-  if(!moov){ result.issues.push("No moov box."); return result; }
+  // Scan for codec, width, height, tracks
+  let codec=null, width=null, height=null, tracks=0;
 
-  for(let i=moov.start+8;i<moov.end;){
-    let size = readUint32(view,i);
-    let type = readString(view,i+4,4);
-    if(type==="trak") result.tracks++;
-    i += size || 8;
-  }
+  function scanMoov(){
+    if(!moov) return;
+    for(let i=moov.start+8;i<moov.end;){
+      let size=view.getUint32(i), type=readString(view,i+4,4);
+      if(type==="trak") tracks++;
 
-  for(let i=moov.start+8;i<moov.end;){
-    let size = readUint32(view,i);
-    let type = readString(view,i+4,4);
-    if(type==="trak"){
-      for(let j=i+8;j<i+size;){
-        let s2 = readUint32(view,j);
-        let t2 = readString(view,j+4,4);
-        if(t2==="mdia"){
-          for(let k=j+8;k<j+s2;){
-            let s3 = readUint32(view,k);
-            let t3 = readString(view,k+4,4);
-            if(t3==="minf"){
-              for(let m=k+8;m<k+s3;){
-                let s4 = readUint32(view,m);
-                let t4 = readString(view,m+4,4);
-                if(t4==="stbl"){
-                  for(let n=m+8;n<m+s4;){
-                    let s5 = readUint32(view,n);
-                    let t5 = readString(view,n+4,4);
-                    if(t5==="stsd"){
-                      let entryType = readString(view,n+16,4);
-                      result.codec = entryType;
-                      result.width = view.getUint16(n+16+24);
-                      result.height = view.getUint16(n+16+26);
+      // deep scan for stsd
+      if(type==="trak"){
+        for(let j=i+8;j<i+size;){
+          let s2=view.getUint32(j), t2=readString(view,j+4,4);
+          if(t2==="mdia"){
+            for(let k=j+8;k<j+s2;){
+              let s3=view.getUint32(k), t3=readString(view,k+4,4);
+              if(t3==="minf"){
+                for(let m=k+8;m<k+s3;){
+                  let s4=view.getUint32(m), t4=readString(view,m+4,4);
+                  if(t4==="stbl"){
+                    for(let n=m+8;n<m+s4;){
+                      let s5=view.getUint32(n), t5=readString(view,n+4,4);
+                      if(t5==="stsd"){
+                        codec = readString(view,n+16,4);
+                        width = view.getUint16(n+40);
+                        height = view.getUint16(n+42);
+                      }
+                      n += s5||8;
                     }
-                    n += s5 || 8;
                   }
+                  m += s4||8;
                 }
-                m += s4 || 8;
               }
+              k += s3||8;
             }
-            k += s3 || 8;
           }
+          j += s2||8;
         }
-        j += s2 || 8;
       }
+      i += size||8;
     }
-    i += size || 8;
   }
-  return result;
+  scanMoov();
+
+  // Basic heuristics
+  function identify(){
+    let issues=[];
+    let summary="";
+
+    // NVIDIA modes acceptance:
+    let brandOK = brands.some(b=>["isom","iso2","mp41","mp42","avc1"].includes(b));
+    let codecOK = codec==="avc1" || codec==="hvc1";
+
+    let looksNvidia = brandOK && codecOK && (height!==1088);
+
+    if(looksNvidia){
+      summary = "✅ VALID: NVIDIA Recording Detected";
+    } else {
+      summary = "❌ INVALID: Not NVIDIA";
+    }
+
+    let details = "";
+    details += "Brands: "+brands.join(", ")+"\n";
+    details += "Codec: "+codec+"\n";
+    details += "Tracks: "+tracks+"\n";
+    details += "Resolution: "+width+"x"+height+"\n";
+
+    if(height===1088) details += "⚠ Height padding 1088 detected (Game Bar/Medal).\n";
+    if(!brandOK) details+="⚠ Container brands inconsistent with NVIDIA.\n";
+    if(!codecOK) details+="⚠ Codec not matching NVIDIA profiles.\n";
+
+    return {summary, details};
+  }
+
+  return identify();
 }
 
-function classify(r){
-  let out = "";
-  if(r.tracks !== 1){
-    out += "❌ Not NVIDIA: NVIDIA uses 1 video track (2 total streams: video+audio).\n";
-  }
-  if(r.codec && !(r.codec==="avc1" || r.codec==="hvc1")){
-    out += "❌ Not NVIDIA: Unexpected codec "+r.codec+"\n";
-  }
-  if(r.height===1088){
-    out += "❌ Not NVIDIA: Height padded to 1088 (Game Bar/Medal signature).\n";
-  }
-  let brandStr = r.brands.join(", ");
-  if(!brandStr.includes("isom") && !brandStr.includes("mp41") && !brandStr.includes("mp42")){
-    out += "❌ Container brands inconsistent with NVIDIA.\n";
-  }
-  if(out==="") out = "✅ Valid NVIDIA (basic verification).";
-  return out;
-}
-
-document.getElementById("dropzone").addEventListener("dragover",e=>{e.preventDefault();});
+document.getElementById("dropzone").addEventListener("dragover",e=>e.preventDefault());
 document.getElementById("dropzone").addEventListener("drop",e=>{
   e.preventDefault();
-  let file = e.dataTransfer.files[0];
-  let reader = new FileReader();
-  reader.onload = function(){
-    let buffer = reader.result;
-    let res = analyzeMP4(buffer);
-    let report = "Brands: "+res.brands.join(", ")+"\n"+
-                 "Codec: "+res.codec+"\n"+
-                 "Tracks: "+res.tracks+"\n"+
-                 "Width/Height: "+res.width+"x"+res.height+"\n"+
-                 "\nAnalysis:\n"+classify(res)+"\n";
-    document.getElementById("result").textContent = report;
+  let file=e.dataTransfer.files[0];
+  let reader=new FileReader();
+  reader.onload=async function(){
+    let res = await analyze(reader.result);
+
+    document.getElementById("result").innerHTML =
+      res.summary +
+      "<div class='details' onclick='document.getElementById("forensic").classList.toggle("hidden")'>Show/Hide Forensic Details</div>" +
+      "<div id='forensic' class='hidden'>"+res.details+"</div>";
   };
   reader.readAsArrayBuffer(file);
 });
